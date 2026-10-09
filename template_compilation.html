@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inside Template Compilation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --border: #d9dee6;
+  --text: #1c2330;
+  --muted: #5b6575;
+  --accent: #3b5bdb;
+  --accent-soft: #e3e9ff;
+  --ok: #2b8a3e;
+  --ok-soft: #e3f6e8;
+  --warn: #b35c00;
+  --warn-soft: #fff1dc;
+  --err: #c92a2a;
+  --err-soft: #ffe3e3;
+  --code-bg: #fbfcfd;
+  --hl-line: #fff6cc;
+  --hl-bar: #f0b400;
+  --subst: #d6f5df;
+  --subst-text: #1b6b33;
+  --tk-kw: #8a3ffc;
+  --tk-type: #0f6fb8;
+  --tk-str: #b04a00;
+  --tk-num: #b04a00;
+  --tk-com: #7c8696;
+  --tk-pp: #c2255c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --surface: #171b23; --surface-2: #1f2430; --border: #2c3341;
+    --text: #e4e8ef; --muted: #98a2b3; --accent: #7b93ff; --accent-soft: #232c4d;
+    --ok: #69db7c; --ok-soft: #17301e; --warn: #ffb44c; --warn-soft: #362810;
+    --err: #ff8787; --err-soft: #3a1a1a; --code-bg: #12161d; --hl-line: #2e2a14;
+    --hl-bar: #f0b400; --subst: #183823; --subst-text: #8ce99a;
+    --tk-kw: #c69bff; --tk-type: #74c0fc; --tk-str: #ffa94d; --tk-num: #ffa94d;
+    --tk-com: #6c7686; --tk-pp: #f783ac;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --surface: #171b23; --surface-2: #1f2430; --border: #2c3341;
+  --text: #e4e8ef; --muted: #98a2b3; --accent: #7b93ff; --accent-soft: #232c4d;
+  --ok: #69db7c; --ok-soft: #17301e; --warn: #ffb44c; --warn-soft: #362810;
+  --err: #ff8787; --err-soft: #3a1a1a; --code-bg: #12161d; --hl-line: #2e2a14;
+  --hl-bar: #f0b400; --subst: #183823; --subst-text: #8ce99a;
+  --tk-kw: #c69bff; --tk-type: #74c0fc; --tk-str: #ffa94d; --tk-num: #ffa94d;
+  --tk-com: #6c7686; --tk-pp: #f783ac;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+code, pre, .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.wrap { max-width: 1240px; margin: 0 auto; padding: 24px 16px 120px; }
+
+header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+header h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+header p { margin: 0; color: var(--muted); max-width: 70ch; }
+.theme-btn {
+  flex: none; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; font-size: 13px;
+}
+
+/* Pipeline */
+.pipeline {
+  display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 12px; margin-bottom: 16px;
+  scrollbar-width: thin;
+}
+.stage {
+  flex: 1 0 auto; min-width: 110px; padding: 8px 10px; border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+  font-size: 12px; line-height: 1.3; position: relative; transition: all .25s;
+}
+.stage b { display: block; font-size: 13px; color: var(--text); }
+.stage.done { border-color: var(--ok); }
+.stage.done b::after { content: " ✓"; color: var(--ok); }
+.stage.active { background: var(--accent-soft); border-color: var(--accent); color: var(--text); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* Main grid */
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.card-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 12px; background: var(--surface-2); border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--muted);
+}
+.card-head .file { font-family: "JetBrains Mono", monospace; color: var(--text); }
+.code-card { position: sticky; top: 12px; }
+@media (max-width: 900px) { .code-card { position: static; } }
+
+pre.code { margin: 0; padding: 8px 0; background: var(--code-bg); overflow-x: auto; font-size: 13px; line-height: 1.65; }
+.ln { display: block; padding: 0 14px 0 0; border-left: 3px solid transparent; transition: background .25s, opacity .25s; white-space: pre; }
+.ln .no { display: inline-block; width: 34px; text-align: right; margin-right: 14px; color: var(--muted); opacity: .6; user-select: none; }
+.code.has-hl .ln { opacity: .45; }
+.code.has-hl .ln.hl { opacity: 1; background: var(--hl-line); border-left-color: var(--hl-bar); }
+
+.tk-kw { color: var(--tk-kw); font-weight: 600; }
+.tk-type { color: var(--tk-type); }
+.tk-str { color: var(--tk-str); }
+.tk-num { color: var(--tk-num); }
+.tk-com { color: var(--tk-com); font-style: italic; }
+.tk-pp { color: var(--tk-pp); }
+.subst { background: var(--subst); color: var(--subst-text); border-radius: 4px; padding: 0 2px; font-weight: 600; animation: pop .6s ease; }
+@keyframes pop { 0% { background: var(--hl-bar); } 100% { background: var(--subst); } }
+
+/* Explanation panel */
+.step-card { padding: 18px 20px 20px; }
+.step-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.pill { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.pill.gray { background: var(--surface-2); color: var(--muted); }
+.step-card h2 { margin: 2px 0 10px; font-size: 21px; letter-spacing: -0.01em; }
+.step-card p { margin: 0 0 12px; }
+.step-card code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: .9em; }
+.fade { animation: fadeIn .35s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+.callout { border-radius: 10px; padding: 10px 14px; margin: 12px 0; font-size: 14px; border: 1px solid; }
+.callout.tip { background: var(--accent-soft); border-color: var(--accent); }
+.callout.ok { background: var(--ok-soft); border-color: var(--ok); }
+.callout.warn { background: var(--warn-soft); border-color: var(--warn); }
+.callout.err { background: var(--err-soft); border-color: var(--err); }
+.callout strong { display: block; margin-bottom: 2px; }
+
+.viz { margin-top: 14px; }
+.viz h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 8px; }
+.viz pre.code { border: 1px solid var(--border); border-radius: 10px; }
+
+table.t { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.t th, table.t td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.t th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.tw { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+.tw table.t tr:last-child td { border-bottom: none; }
+.yes { color: var(--ok); font-weight: 600; }
+.no { color: var(--muted); }
+.bad { color: var(--err); font-weight: 600; }
+
+.boxes { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+.box {
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface-2);
+  font-size: 13px;
+}
+.box .title { font-family: "JetBrains Mono", monospace; font-weight: 600; margin-bottom: 4px; }
+.box.blueprint { border-style: dashed; border-color: var(--accent); background: transparent; }
+.box.new { border-color: var(--ok); background: var(--ok-soft); animation: fadeIn .4s ease; }
+.box.reused { border-color: var(--hl-bar); }
+.box ul { margin: 4px 0 0; padding-left: 18px; }
+
+.flow { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+.flow .box { flex: 1 1 140px; }
+.arrow { align-self: center; color: var(--muted); font-size: 20px; flex: none; }
+
+.terminal {
+  background: #11141a; color: #d5dbe5; border-radius: 10px; padding: 12px 14px; font-size: 12.5px;
+  line-height: 1.6; overflow-x: auto; white-space: pre; border: 1px solid var(--border);
+}
+.terminal .e { color: #ff8787; font-weight: 600; }
+.terminal .n { color: #74c0fc; }
+.terminal .p { color: #8b95a7; }
+.terminal .g { color: #69db7c; }
+
+/* Quiz */
+.q { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.q .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.q button {
+  font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  padding: 5px 10px; border-radius: 8px; cursor: pointer;
+}
+.q button.right { background: var(--ok-soft); border-color: var(--ok); }
+.q button.wrong { background: var(--err-soft); border-color: var(--err); }
+.q .ans { display: none; margin-top: 8px; font-size: 14px; color: var(--muted); }
+.q.answered .ans { display: block; }
+
+/* Nav */
+.nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(8px); border-top: 1px solid var(--border);
+}
+.nav-inner { max-width: 1240px; margin: 0 auto; padding: 10px 16px; display: flex; align-items: center; gap: 12px; }
+.nav button.main {
+  font: inherit; font-weight: 600; padding: 8px 16px; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+}
+.nav button.main.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.nav button.main:disabled { opacity: .4; cursor: default; }
+.dots { flex: 1; display: flex; justify-content: center; gap: 6px; flex-wrap: wrap; }
+.dot { width: 10px; height: 10px; border-radius: 50%; border: none; background: var(--border); cursor: pointer; padding: 0; }
+.dot.on { background: var(--accent); transform: scale(1.3); }
+.dot.past { background: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.counter { font-size: 12px; color: var(--muted); min-width: 52px; text-align: center; }
+.kbd-hint { font-size: 12px; color: var(--muted); }
+@media (max-width: 600px) { .kbd-hint { display: none; } .nav button.main { padding: 8px 12px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>How the C++ compiler handles template classes</h1>
+      <p>Step through one small program and watch what the compiler does with <code>template &lt;typename T&gt; class Box</code>: from a plain blueprint to real machine code, and finally the linker.</p>
+    </div>
+    <button class="theme-btn" id="themeBtn" type="button">◐ Theme</button>
+  </header>
+
+  <div class="pipeline" id="pipeline"></div>
+
+  <div class="grid">
+    <div class="card code-card">
+      <div class="card-head"><span class="file" id="fileName">main.cpp</span><span id="codeNote">source code</span></div>
+      <pre class="code" id="code"></pre>
+    </div>
+    <div class="card step-card">
+      <div id="step" class="fade"></div>
+    </div>
+  </div>
+</div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <button class="main" id="prev" type="button">← Back</button>
+    <div class="dots" id="dots"></div>
+    <span class="counter" id="counter"></span>
+    <span class="kbd-hint">use ← → keys</span>
+    <button class="main primary" id="next" type="button">Next →</button>
+  </div>
+</nav>
+
+<script>
+/* ---------- tiny C++ highlighter ---------- */
+const KW = new Set("template typename class struct public private protected const return void int bool char double float auto if else for while new delete this operator using namespace extern static_assert requires concept true false".split(" "));
+const TYPES = new Set("Box std string cout T U size_t".split(" "));
+function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function hlPlain(src) {
+  const re = /(\/\/.*$)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(#\w+)|(\b\d+\b)|([A-Za-z_]\w*)|([\s\S])/gm;
+  let out = "", m;
+  while ((m = re.exec(src))) {
+    if (m[1]) out += `<span class="tk-com">${esc(m[1])}</span>`;
+    else if (m[2]) out += `<span class="tk-str">${esc(m[2])}</span>`;
+    else if (m[3]) out += `<span class="tk-pp">${esc(m[3])}</span>`;
+    else if (m[4]) out += `<span class="tk-num">${m[4]}</span>`;
+    else if (m[5]) out += KW.has(m[5]) ? `<span class="tk-kw">${m[5]}</span>` : TYPES.has(m[5]) ? `<span class="tk-type">${m[5]}</span>` : m[5];
+    else out += esc(m[6]);
+  }
+  return out;
+}
+// ⟦...⟧ marks text the compiler substituted; it gets a green highlight
+function hl(src) {
+  return src.split(/(⟦[^⟧]*⟧)/).map(part =>
+    part.startsWith("⟦") ? `<span class="subst">${hlPlain(part.slice(1, -1))}</span>` : hlPlain(part)
+  ).join("");
+}
+function codeBlock(src, hlLines = []) {
+  const lines = src.replace(/^\n/, "").replace(/\s+$/, "").split("\n");
+  const set = new Set(hlLines);
+  return `<pre class="code${set.size ? " has-hl" : ""}">` + lines.map((l, i) =>
+    `<span class="ln${set.has(i + 1) ? " hl" : ""}"><span class="no">${i + 1}</span>${hl(l) || " "}</span>`
+  ).join("") + "</pre>";
+}
+
+/* ---------- source files ---------- */
+const MAIN = `
+#include <iostream>
+#include <string>
+
+template <typename T>
+class Box {
+    T value;
+public:
+    Box(T v) : value(v) {}
+    T get() const { return value; }
+    void print() const { std::cout << value << '\\n'; }
+    void bad() const { value.foo(); }  // suspicious!
+};
+
+int main() {
+    Box<int> a(42);
+    int x = a.get();
+
+    Box<std::string> s("hi");
+    s.print();
+
+    Box<int> b(7);
+}`;
+
+const SPLIT_H = `
+// box.h
+template <typename T>
+class Box {
+    T value;
+public:
+    Box(T v);
+    T get() const;   // only declared here
+};`;
+
+const SPLIT_CPP = `
+// box.cpp
+#include "box.h"
+
+template <typename T>
+Box<T>::Box(T v) : value(v) {}
+
+template <typename T>
+T Box<T>::get() const { return value; }`;
+
+const SPLIT_MAIN = `
+// main.cpp
+#include "box.h"
+
+int main() {
+    Box<int> a(42);
+    return a.get();
+}`;
+
+const SPEC = `
+template <typename T>          // primary template
+class Box { /* ... */ };
+
+template <typename T>          // partial specialization:
+class Box<T*> { /* ... */ };   // any pointer type
+
+template <>                    // full specialization:
+class Box<bool> { /* ... */ }; // exactly bool
+
+Box<int>    a(1);        // → primary
+Box<char*>  p(nullptr);  // → Box<T*> with T = char
+Box<bool>   f(true);     // → Box<bool>`;
+
+/* ---------- pipeline stages ---------- */
+const STAGES = [
+  ["Preprocess", "#include pasted"],
+  ["Phase 1", "parse the template"],
+  ["Deduce", "find T"],
+  ["Instantiate", "substitute T"],
+  ["Phase 2", "check with real T"],
+  ["Codegen", "mangle & emit"],
+  ["Link", "merge object files"],
+];
+
+/* ---------- steps ---------- */
+const STEPS = [
+{
+  stage: -1, pill: "Overview", title: "A template is a recipe, not a class",
+  file: "main.cpp", code: MAIN, lines: [],
+  body: `
+  <p>When you write <code>template &lt;typename T&gt; class Box</code>, you have <b>not</b> created a class. You have given the compiler a <b>blueprint</b> for building classes. No machine code exists for <code>Box</code> on its own.</p>
+  <p>A real class appears only when the code <i>uses</i> the template with a concrete type, such as <code>Box&lt;int&gt;</code>. The compiler then stamps out a copy of the blueprint with <code>T</code> replaced by <code>int</code>. This is called <b>instantiation</b>.</p>
+  <div class="viz">
+    <h3>The big idea</h3>
+    <div class="flow">
+      <div class="box blueprint"><div class="title">Box&lt;T&gt;</div>blueprint<br>0 bytes of code</div>
+      <div class="arrow">→</div>
+      <div class="box new"><div class="title">Box&lt;int&gt;</div>real class</div>
+      <div class="box new"><div class="title">Box&lt;std::string&gt;</div>another real class</div>
+    </div>
+  </div>
+  <div class="callout tip"><strong>How to read this page</strong>The left panel is the program being compiled. Highlighted lines are what the compiler is looking at in each step. The bar at the top shows where we are in the pipeline.</div>`
+},
+{
+  stage: 0, pill: "Preprocessor", title: "#include copies text",
+  file: "main.cpp", code: MAIN, lines: [1, 2],
+  body: `
+  <p>Before compiling, the <b>preprocessor</b> replaces every <code>#include</code> with the full text of that header. The result is one large file called a <b>translation unit</b> (TU).</p>
+  <p>This matters for templates. To build <code>Box&lt;int&gt;</code>, the compiler needs the <b>full definition</b> of <code>Box</code>, including the function bodies, inside the same TU where <code>Box&lt;int&gt;</code> is used. A declaration alone is not enough.</p>
+  <div class="callout warn"><strong>Keep this in mind</strong>This is why template code usually lives entirely in header files. A later step shows what goes wrong otherwise.</div>`
+},
+{
+  stage: 1, pill: "Phase 1 · definition", title: "Parse the template once and store it",
+  file: "main.cpp", code: MAIN, lines: [4, 5, 6, 7, 8, 9, 10, 11, 12],
+  body: `
+  <p>The compiler reads the template definition and stores it in its symbol table as a <b>template</b>. It does not generate any code yet. It does check whatever it can check without knowing <code>T</code>. This is called <b>two-phase name lookup</b>, and this is phase 1.</p>
+  <div class="viz">
+    <h3>What gets checked now vs. later</h3>
+    <div class="tw"><table class="t">
+      <tr><th>Expression</th><th>Depends on T?</th><th>When checked</th></tr>
+      <tr><td><code>Box(T v)</code> syntax</td><td>—</td><td class="yes">now: syntax is always checked</td></tr>
+      <tr><td><code>std::cout</code></td><td>no</td><td class="yes">now: must already be declared</td></tr>
+      <tr><td><code>std::cout &lt;&lt; value</code></td><td>yes (<code>value</code> is a <code>T</code>)</td><td class="no">later, once T is known</td></tr>
+      <tr><td><code>value.foo()</code></td><td>yes</td><td class="no">later, once T is known</td></tr>
+    </table></div>
+    <h3>Compiler's symbol table</h3>
+    <div class="boxes">
+      <div class="box blueprint"><div class="title">template Box&lt;T&gt;</div>stored as a parsed tree<br>instantiations: <i>none yet</i></div>
+    </div>
+  </div>
+  <div class="callout ok"><strong>Why <code>bad()</code> is accepted</strong><code>value.foo()</code> might be valid for some type <code>T</code>, so the compiler can't reject it yet. In contrast, a call like <code>undeclared_fn();</code> that doesn't involve <code>T</code> is rejected immediately.</div>`
+},
+{
+  stage: 2, pill: "Use found", title: "A use appears, so work out T",
+  file: "main.cpp", code: MAIN, lines: [15],
+  body: `
+  <p>The compiler reaches <code>Box&lt;int&gt; a(42);</code>. To create a variable it needs a <b>complete type</b>, meaning it needs to know its size and members. That requirement triggers instantiation.</p>
+  <p>First the compiler works out the <b>template arguments</b>. Here they are written explicitly:</p>
+  <div class="viz">
+    <div class="flow">
+      <div class="box"><div class="title">Box&lt;int&gt;</div>written by you</div>
+      <div class="arrow">→</div>
+      <div class="box new"><div class="title">T = int</div>template argument</div>
+    </div>
+  </div>
+  <div class="callout tip"><strong>C++17: class template argument deduction (CTAD)</strong>You can also write <code>Box a(42);</code> and the compiler deduces <code>T = int</code> from the constructor argument. Watch out: <code>Box s("hi");</code> deduces <code>T = const char*</code>, not <code>std::string</code>.</div>`
+},
+{
+  stage: 3, pill: "Instantiation", title: "Substitute T to make Box<int>",
+  file: "main.cpp", code: MAIN, lines: [15],
+  body: `
+  <p>The compiler now <b>implicitly instantiates</b> the class. It copies the blueprint and replaces every <code>T</code> with <code>int</code>. The result is a brand new class named <code>Box&lt;int&gt;</code>.</p>
+  <div class="viz">
+    <h3>What the compiler generates internally (green = substituted)</h3>
+    ${codeBlock(`
+class Box<⟦int⟧> {
+    ⟦int⟧ value;
+public:
+    Box(⟦int⟧ v);              // declaration only
+    ⟦int⟧ get() const;         // declaration only
+    void print() const;       // declaration only
+    void bad() const;         // declaration only
+};
+// sizeof(Box<int>) == sizeof(int) is now known`)}
+  </div>
+  <div class="callout warn"><strong>Notice: declarations only</strong>Instantiating the class gives the compiler its data members and the <i>signatures</i> of its member functions. The member function <b>bodies</b> are not instantiated yet. That happens on demand, in the next step.</div>`
+},
+{
+  stage: 3, pill: "Lazy instantiation", title: "Only the member functions you call are built",
+  file: "main.cpp", code: MAIN, lines: [15, 16],
+  body: `
+  <p>Line 15 calls the constructor and line 16 calls <code>get()</code>. Only those two function bodies are instantiated for <code>int</code>.</p>
+  <div class="viz">
+    <h3>Members of Box&lt;int&gt;</h3>
+    <div class="tw"><table class="t">
+      <tr><th>Member</th><th>Used?</th><th>Body instantiated?</th></tr>
+      <tr><td><code>Box(int)</code></td><td>line 15</td><td class="yes">✓ yes</td></tr>
+      <tr><td><code>int get() const</code></td><td>line 16</td><td class="yes">✓ yes</td></tr>
+      <tr><td><code>void print() const</code></td><td>never</td><td class="no">✗ no</td></tr>
+      <tr><td><code>void bad() const</code></td><td>never</td><td class="no">✗ no</td></tr>
+    </table></div>
+    <h3>Generated bodies</h3>
+    ${codeBlock(`
+Box<⟦int⟧>::Box(⟦int⟧ v) : value(v) {}
+⟦int⟧ Box<⟦int⟧>::get() const { return value; }`)}
+  </div>
+  <div class="callout ok"><strong>This is why <code>bad()</code> causes no error</strong><code>int</code> has no member <code>foo</code>, so <code>value.foo()</code> would be invalid for <code>int</code>. But <code>bad()</code> is never called, so its body is never instantiated and never checked against <code>int</code>.</div>`
+},
+{
+  stage: 3, pill: "Instantiation", title: "A different T gives a completely different class",
+  file: "main.cpp", code: MAIN, lines: [18, 19],
+  body: `
+  <p><code>Box&lt;std::string&gt;</code> is a new set of template arguments. The compiler repeats the deduce → substitute → instantiate process and creates a <b>second, independent</b> class.</p>
+  <div class="viz">
+    <h3>Instantiations so far</h3>
+    <div class="boxes">
+      <div class="box blueprint"><div class="title">template Box&lt;T&gt;</div>blueprint</div>
+      <div class="box"><div class="title">Box&lt;int&gt;</div><ul><li>Box(int) ✓</li><li>get() ✓</li></ul></div>
+      <div class="box new"><div class="title">Box&lt;std::string&gt;</div><ul><li>Box(std::string) ✓</li><li>print() ✓</li></ul></div>
+    </div>
+    <h3>Generated for std::string</h3>
+    ${codeBlock(`
+Box<⟦std::string⟧>::Box(⟦std::string⟧ v) : value(v) {}
+void Box<⟦std::string⟧>::print() const {
+    std::cout << value << '\\n';   // now resolved: operator<<(ostream&, const string&)
+}`)}
+  </div>
+  <div class="callout tip"><strong>Separate types</strong><code>Box&lt;int&gt;</code> and <code>Box&lt;std::string&gt;</code> are unrelated. You can't assign one to the other, they share no code, and <code>static</code> members are separate. Each new <code>T</code> adds more machine code, which is sometimes called <i>code bloat</i>.</div>`
+},
+{
+  stage: 3, pill: "Cache hit", title: "Same arguments reuse the same class",
+  file: "main.cpp", code: MAIN, lines: [21],
+  body: `
+  <p><code>Box&lt;int&gt; b(7);</code> uses arguments the compiler has already seen. It looks up <code>Box&lt;int&gt;</code> in its table of instantiations, finds it, and <b>reuses</b> it. Nothing new is generated, because the constructor was already instantiated at line 15.</p>
+  <div class="viz">
+    <h3>Instantiation table (inside this translation unit)</h3>
+    <div class="tw"><table class="t">
+      <tr><th>Key</th><th>First created</th><th>Times requested</th></tr>
+      <tr><td><code>Box&lt;int&gt;</code></td><td>line 15</td><td><b>2</b> (lines 15, 21) ← reused</td></tr>
+      <tr><td><code>Box&lt;std::string&gt;</code></td><td>line 18</td><td>1</td></tr>
+    </table></div>
+  </div>`
+},
+{
+  stage: 4, pill: "Phase 2 · instantiation", title: "Errors appear only when T is known",
+  file: "main.cpp (modified)", code: MAIN.replace("    Box<int> b(7);", "    Box<int> b(7);\n    b.bad();          // ← new line"), lines: [11, 22],
+  body: `
+  <p>Suppose we add <code>b.bad();</code>. Now <code>Box&lt;int&gt;::bad()</code> must be instantiated. With <code>T = int</code>, phase-2 checking runs <code>value.foo()</code> with an <code>int</code>, and that is invalid.</p>
+  <div class="viz">
+    <h3>Compiler output (clang)</h3>
+<div class="terminal">main.cpp:11:29: <span class="e">error:</span> member reference base type 'const int' is not a structure or union
+    void bad() const { value.foo(); }
+                       <span class="g">~~~~~^~~~</span>
+main.cpp:22:7: <span class="n">note:</span> in instantiation of member function 'Box&lt;int&gt;::bad' requested here
+    b.bad();
+      <span class="g">^</span></div>
+  </div>
+  <p>The error points at the <b>template</b> (line 11), and a <b>note</b> traces back to the use that triggered it (line 22). With several layers of nested templates, these "in instantiation of…" chains are what make template errors so long.</p>
+  <div class="callout tip"><strong>C++20 concepts</strong>Using <code>template &lt;std::copyable T&gt;</code> or a <code>requires</code> clause lets the compiler reject a bad <code>T</code> at the point of use, with a short message, before it starts instantiating anything.</div>`
+},
+{
+  stage: 5, pill: "Code generation", title: "Unique names and machine code",
+  file: "main.cpp", code: MAIN, lines: [15, 16, 18, 19],
+  body: `
+  <p>Each instantiated function becomes ordinary machine code. The linker only understands plain names, so the compiler <b>mangles</b> each function's full name, including its template arguments, into a single symbol.</p>
+  <div class="viz">
+    <h3>Symbols in main.o</h3>
+    <div class="tw"><table class="t">
+      <tr><th>Mangled symbol (Itanium ABI)</th><th>Meaning</th></tr>
+      <tr><td class="mono">_ZN3BoxIiEC1Ei</td><td><code>Box&lt;int&gt;::Box(int)</code></td></tr>
+      <tr><td class="mono">_ZNK3BoxIiE3getEv</td><td><code>Box&lt;int&gt;::get() const</code></td></tr>
+      <tr><td class="mono">_ZN3BoxINSt7__cxx11…EEC1ES5_</td><td><code>Box&lt;std::string&gt;::Box(std::string)</code></td></tr>
+      <tr><td class="mono">_ZNK3BoxINSt7__cxx11…EE5printEv</td><td><code>Box&lt;std::string&gt;::print() const</code></td></tr>
+    </table></div>
+    <h3>Decoding one name</h3>
+    <div class="flow mono" style="font-size:13px">
+      <div class="box"><div class="title">_Z N K</div>C++ name, nested, const</div>
+      <div class="box"><div class="title">3Box</div>"Box" (3 chars)</div>
+      <div class="box new"><div class="title">I i E</div>template args: &lt;int&gt;</div>
+      <div class="box"><div class="title">3get</div>"get"</div>
+      <div class="box"><div class="title">E v</div>end, takes (void)</div>
+    </div>
+    <h3>$ nm -C main.o</h3>
+<div class="terminal"><span class="p">0000000000000000</span> <span class="g">W</span> Box&lt;int&gt;::Box(int)
+<span class="p">0000000000000000</span> <span class="g">W</span> Box&lt;int&gt;::get() const
+<span class="p">0000000000000000</span> <span class="g">W</span> Box&lt;std::string&gt;::Box(std::string)
+<span class="p">0000000000000000</span> <span class="g">W</span> Box&lt;std::string&gt;::print() const
+<span class="p">0000000000000000</span> T main</div>
+  </div>
+  <div class="callout tip"><strong>What does the <code>W</code> mean?</strong>It marks a <b>weak</b> symbol. Template instantiations are emitted as weak (also called COMDAT or <i>linkonce</i>) symbols. That tells the linker: "other files may contain the same function; keep one copy." You'll see why that matters next.</div>`
+},
+{
+  stage: 6, pill: "Linker", title: "Duplicate instantiations get merged",
+  file: "main.cpp", code: MAIN, lines: [],
+  body: `
+  <p>Each <code>.cpp</code> file is compiled <b>separately</b>. If both <code>main.cpp</code> and <code>other.cpp</code> include <code>box.h</code> and use <code>Box&lt;int&gt;::get()</code>, then <b>each</b> object file contains its own copy of that function.</p>
+  <div class="viz">
+    <div class="flow">
+      <div class="box"><div class="title">main.o</div><ul><li>Box&lt;int&gt;::get <b>W</b></li><li>Box&lt;int&gt;::Box <b>W</b></li><li>main <b>T</b></li></ul></div>
+      <div class="box"><div class="title">other.o</div><ul><li>Box&lt;int&gt;::get <b>W</b></li><li>helper <b>T</b></li></ul></div>
+      <div class="arrow">→ ld →</div>
+      <div class="box new"><div class="title">a.out</div><ul><li>Box&lt;int&gt;::get <i>(1 copy)</i></li><li>Box&lt;int&gt;::Box</li><li>main, helper</li></ul></div>
+    </div>
+  </div>
+  <p>Normally, defining the same function in two object files causes a "multiple definition" error. Weak template symbols are the exception: the linker keeps <b>one</b> copy and discards the others. This is allowed because the One Definition Rule (ODR) guarantees that all the copies are identical.</p>
+  <div class="callout warn"><strong>Cost</strong>Every TU repeats the instantiation work, which slows down builds. The linker only removes the duplicates at the end. Large template-heavy projects can use <code>extern template</code> to avoid this (see the next step).</div>`
+},
+{
+  stage: 6, pill: "Common pitfall", title: "Why template code belongs in headers",
+  file: "box.h / box.cpp / main.cpp", code: SPLIT_H + "\n" + SPLIT_CPP + "\n" + SPLIT_MAIN, lines: [6, 7, 13, 14, 16, 17, 23, 24],
+  body: `
+  <p>A common mistake is splitting a template the way you'd split a normal class: declarations in <code>box.h</code> and bodies in <code>box.cpp</code>.</p>
+  <div class="viz">
+    <div class="tw"><table class="t">
+      <tr><th>While compiling…</th><th>The compiler sees</th><th>Result</th></tr>
+      <tr><td><code>box.cpp</code></td><td>the bodies, but no use of <code>Box&lt;int&gt;</code></td><td class="no">instantiates nothing; box.o is empty</td></tr>
+      <tr><td><code>main.cpp</code></td><td>a use of <code>Box&lt;int&gt;</code>, but no bodies</td><td class="no">can't instantiate, so it emits an <i>external reference</i></td></tr>
+      <tr><td>linker</td><td>references with no definitions</td><td class="bad">error</td></tr>
+    </table></div>
+    <h3>Linker output</h3>
+<div class="terminal"><span class="e">undefined reference</span> to &#96;Box&lt;int&gt;::Box(int)'
+<span class="e">undefined reference</span> to &#96;Box&lt;int&gt;::get() const'
+collect2: <span class="e">error:</span> ld returned 1 exit status</div>
+  </div>
+  <div class="callout ok"><strong>Fix 1 (usual): define everything in the header</strong>Then every TU that uses <code>Box&lt;X&gt;</code> can see the bodies and instantiate them.</div>
+  <div class="callout ok"><strong>Fix 2: explicit instantiation</strong>Add <code>template class Box&lt;int&gt;;</code> at the end of <code>box.cpp</code>. That forces <i>all</i> members to be generated there for <code>int</code>. Other files can add <code>extern template class Box&lt;int&gt;;</code> to say "don't instantiate this here; it exists elsewhere." The limitation is that only the types you list will work.</div>`
+},
+{
+  stage: 3, pill: "Specialization", title: "How the compiler picks among specializations",
+  file: "specialization.cpp", code: SPEC, lines: [1, 2, 4, 5, 7, 8, 10, 11, 12],
+  body: `
+  <p>You can provide a different version of the class for particular types. Before instantiating, the compiler checks every specialization that matches and picks the <b>most specialized</b> one.</p>
+  <div class="viz">
+    <div class="tw"><table class="t">
+      <tr><th>Use</th><th>Candidates that match</th><th>Chosen</th></tr>
+      <tr><td><code>Box&lt;int&gt;</code></td><td>primary</td><td class="yes">primary, with T = int</td></tr>
+      <tr><td><code>Box&lt;char*&gt;</code></td><td>primary, <code>Box&lt;T*&gt;</code></td><td class="yes"><code>Box&lt;T*&gt;</code>, with T = char</td></tr>
+      <tr><td><code>Box&lt;bool&gt;</code></td><td>primary, <code>Box&lt;bool&gt;</code></td><td class="yes"><code>Box&lt;bool&gt;</code> (exact match)</td></tr>
+    </table></div>
+  </div>
+  <div class="callout tip"><strong>A specialization is a separate class</strong>It does not inherit anything from the primary template. It can have completely different members. The standard library's <code>std::vector&lt;bool&gt;</code> is a famous example: it stores bits instead of <code>bool</code>s.</div>`
+},
+{
+  stage: 7, pill: "Recap", title: "Summary and quick check",
+  file: "main.cpp", code: MAIN, lines: [],
+  body: `
+  <div class="tw" style="margin-bottom:14px"><table class="t">
+    <tr><th>#</th><th>What the compiler does</th></tr>
+    <tr><td>1</td><td>Parses the template once, checks syntax and names that don't depend on T, and stores it. No code yet.</td></tr>
+    <tr><td>2</td><td>On a use like <code>Box&lt;int&gt;</code>, determines T (written explicitly or deduced).</td></tr>
+    <tr><td>3</td><td>Picks the most specialized matching template.</td></tr>
+    <tr><td>4</td><td>Instantiates the class: data members and member <i>declarations</i>.</td></tr>
+    <tr><td>5</td><td>Instantiates member function <i>bodies</i> only when they are used, and checks them with the real T.</td></tr>
+    <tr><td>6</td><td>Reuses existing instantiations within a translation unit.</td></tr>
+    <tr><td>7</td><td>Emits mangled, weak symbols; the linker keeps one copy of each.</td></tr>
+  </table></div>
+  <h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:16px 0 8px">Quick check</h3>
+  <div id="quiz"></div>`
+},
+];
+
+const QUIZ = [
+  { q: "The program has <code>Box&lt;int&gt;</code> and never calls <code>print()</code>. Is <code>Box&lt;int&gt;::print()</code> compiled to machine code?",
+    opts: ["Yes", "No"], a: 1,
+    why: "Member function bodies are instantiated only when used. <code>print()</code> is never called on a <code>Box&lt;int&gt;</code>." },
+  { q: "How many distinct classes do <code>Box&lt;int&gt;</code>, <code>Box&lt;double&gt;</code> and a second <code>Box&lt;int&gt;</code> produce?",
+    opts: ["1", "2", "3"], a: 1,
+    why: "Each distinct set of template arguments produces one class. The second <code>Box&lt;int&gt;</code> reuses the first." },
+  { q: "You declare the template in <code>box.h</code> and define the bodies in <code>box.cpp</code>, without explicit instantiation. When does the error appear?",
+    opts: ["Compiling box.cpp", "Compiling main.cpp", "Linking"], a: 2,
+    why: "Both files compile without errors. <code>main.o</code> expects the symbols to be defined somewhere else, nobody generates them, and the linker reports an undefined reference." },
+  { q: "Template bodies get instantiated in several .cpp files. Why is there no \"multiple definition\" error?",
+    opts: ["The compiler shares them between files", "They're weak/COMDAT symbols that the linker merges", "Templates are always inline-expanded"], a: 1,
+    why: "Each object file has its own copy marked weak, and the linker keeps one. The ODR guarantees that all the copies are identical." },
+];
+
+/* ---------- rendering ---------- */
+let cur = 0;
+const $ = id => document.getElementById(id);
+
+function renderPipeline(stage) {
+  $("pipeline").innerHTML = STAGES.map(([name, sub], i) => {
+    const cls = stage === 7 || i < stage ? "done" : i === stage ? "active" : "";
+    return `<div class="stage ${cls}"><b>${name}</b>${sub}</div>`;
+  }).join("");
+  const active = $("pipeline").querySelector(".active");
+  if (active) active.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
+}
+
+function renderQuiz() {
+  const root = $("quiz");
+  if (!root) return;
+  root.innerHTML = QUIZ.map((item, qi) => `
+    <div class="q" data-q="${qi}">
+      <div>${qi + 1}. ${item.q}</div>
+      <div class="opts">${item.opts.map((o, oi) => `<button type="button" data-o="${oi}">${o}</button>`).join("")}</div>
+      <div class="ans">${item.why}</div>
+    </div>`).join("");
+  root.querySelectorAll(".q button").forEach(btn => btn.addEventListener("click", () => {
+    const qEl = btn.closest(".q"), item = QUIZ[+qEl.dataset.q], oi = +btn.dataset.o;
+    qEl.querySelectorAll("button").forEach((b, i) => {
+      b.classList.remove("right", "wrong");
+      if (i === item.a) b.classList.add("right");
+    });
+    if (oi !== item.a) btn.classList.add("wrong");
+    qEl.classList.add("answered");
+  }));
+}
+
+function render() {
+  const s = STEPS[cur];
+  renderPipeline(s.stage);
+  $("fileName").textContent = s.file;
+  $("codeNote").textContent = s.lines.length ? "highlighted = compiler's focus" : "source code";
+  $("code").outerHTML = codeBlock(s.code, s.lines).replace('<pre class="code', '<pre id="code" class="code');
+
+  const step = $("step");
+  step.classList.remove("fade"); void step.offsetWidth; step.classList.add("fade");
+  step.innerHTML = `
+    <div class="step-meta"><span class="pill">${s.pill}</span><span class="pill gray">${cur + 1} / ${STEPS.length}</span></div>
+    <h2>${esc(s.title)}</h2>${s.body}`;
+  renderQuiz();
+
+  $("dots").innerHTML = STEPS.map((_, i) =>
+    `<button class="dot ${i === cur ? "on" : i < cur ? "past" : ""}" data-i="${i}" aria-label="Go to step ${i + 1}" type="button"></button>`).join("");
+  $("dots").querySelectorAll(".dot").forEach(d => d.addEventListener("click", () => go(+d.dataset.i)));
+  $("counter").textContent = `${cur + 1} / ${STEPS.length}`;
+  $("prev").disabled = cur === 0;
+  $("next").disabled = cur === STEPS.length - 1;
+  $("next").textContent = cur === STEPS.length - 2 ? "Finish →" : "Next →";
+  try { history.replaceState(null, "", "#step-" + (cur + 1)); } catch (e) {}
+}
+
+function go(i) {
+  cur = Math.max(0, Math.min(STEPS.length - 1, i));
+  render();
+  if (window.innerWidth <= 900) window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+$("prev").addEventListener("click", () => go(cur - 1));
+$("next").addEventListener("click", () => go(cur + 1));
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") go(cur + 1);
+  if (e.key === "ArrowLeft") go(cur - 1);
+});
+
+$("themeBtn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+});
+try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+
+const m = location.hash.match(/step-(\d+)/);
+if (m) cur = Math.max(0, Math.min(STEPS.length - 1, +m[1] - 1));
+render();
+</script>
+</body>
+</html>
