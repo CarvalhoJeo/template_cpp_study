@@ -11,7 +11,7 @@ class MyArray {
     public:
         MyArray(T array[], int s);
         void print();
-        MyArray<T> bubble_sort();
+        T* bubble_sort();
         void print_bubble_sort_stats();
 };
 
@@ -33,7 +33,7 @@ void MyArray<T>::print() {
 }
 
 template <typename T>
-MyArray<T> MyArray<T>::bubble_sort(){
+T* MyArray<T>::bubble_sort(){
     for(int i = 0; i < size-1; i++){
         for(int j = 0; j < size-1-i; j++){
             if(p[j] > p[j+1]){
@@ -43,7 +43,7 @@ MyArray<T> MyArray<T>::bubble_sort(){
             }
         }
     }
-    return *this;
+    return p;
 }
 
 
